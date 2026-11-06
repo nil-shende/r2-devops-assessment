@@ -1,0 +1,437 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 COMPUTE - CONTAINERIZED: Amazon ECS cluster on an EC2 Auto Scaling group
+  (capacity provider), frontend + backend services behind the shared ALB on
+  port 80 (443 with a certificate). Images come from ECR. The image tag is read
+  from SSM Parameter Store, which the APPLICATION pipeline owns - so infra
+  deployments never roll back an application release.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  ImageTag:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM parameter NAME that holds the currently released image tag (written by the app pipeline)
+    Default: /r2app/dev/release/image-tag
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  MinHosts: { Type: Number, Default: 1 }
+  MaxHosts: { Type: Number, Default: 2 }
+  DesiredTasks: { Type: Number, Default: 1 }
+  MinTasks: { Type: Number, Default: 1 }
+  MaxTasks: { Type: Number, Default: 2 }
+  ListenerPort: { Type: Number, Default: 80 }
+  HttpsListenerPort: { Type: Number, Default: 443 }
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM certificate ARN - enables HTTPS and redirects HTTP to HTTPS
+  ContainerInsights:
+    Type: String
+    AllowedValues: [enabled, disabled]
+    Default: disabled
+  LogRetentionDays: { Type: Number, Default: 14 }
+
+Conditions:
+  HasCert: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # ================================================================ Cluster + capacity
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${EnvironmentName}
+      ClusterSettings: [{ Name: containerInsights, Value: !Ref ContainerInsights }]
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-ecs-instance-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # shell access via Session Manager, no SSH
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref EcsInstanceRole] }
+
+  EcsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt EcsInstanceProfile.Arn }
+        SecurityGroupIds: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-EcsHostSgId" }]
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only
+          HttpPutResponseHopLimit: 1    # bridge-mode containers cannot reach IMDS => they must use their task role
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-ecs-host" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat >> /etc/ecs/ecs.config <<EOF
+            ECS_CLUSTER=${ProjectName}-${EnvironmentName}
+            ECS_ENABLE_TASK_IAM_ROLE=true
+            ECS_ENABLE_CONTAINER_METADATA=true
+            ECS_CONTAINER_STOP_TIMEOUT=30s
+            EOF
+
+  EcsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref MinHosts
+        MaxBatchSize: 1
+        PauseTime: PT5M
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${EnvironmentName}-ecs-asg
+      VPCZoneIdentifier: !Split [",", { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-ComputeSubnetIds" }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EcsLaunchTemplate
+        Version: !GetAtt EcsLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinHosts
+      MaxSize: !Ref MaxHosts
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      Tags:
+        - { Key: AmazonECSManaged, Value: "", PropagateAtLaunch: true }
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref EcsAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100          # ECS adds/removes hosts so tasks always fit
+        ManagedTerminationProtection: DISABLED
+
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref CapacityProvider]
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: !Ref CapacityProvider, Weight: 1 }
+
+  # ================================================================ IAM for tasks
+  TaskExecutionRole:          # used by the ECS agent: pull from ECR, write logs
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  BackendTaskRole:            # used by the application code itself
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-ecs-backend-task-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbSecretArn" }
+
+  # ================================================================ Logs
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/${EnvironmentName}/ecs/frontend
+      RetentionInDays: !Ref LogRetentionDays
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/${EnvironmentName}/ecs/backend
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ================================================================ Task definitions
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${EnvironmentName}-frontend
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${ProjectName}-shared-FrontendRepositoryUri" }
+          Essential: true
+          Cpu: 256
+          MemoryReservation: 160
+          Memory: 512
+          PortMappings: [{ ContainerPort: 3000, HostPort: 0, Protocol: tcp }]
+          Environment:
+            - { Name: APP_ENV, Value: !Ref EnvironmentName }
+            - { Name: DEPLOYMENT_TARGET, Value: ecs }
+            - { Name: HOSTNAME, Value: 0.0.0.0 }   # make Next.js listen on all interfaces
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${EnvironmentName}-backend
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt BackendTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${ProjectName}-shared-BackendRepositoryUri" }
+          Essential: true
+          Cpu: 256
+          MemoryReservation: 160
+          Memory: 512
+          PortMappings: [{ ContainerPort: 8000, HostPort: 0, Protocol: tcp }]
+          Environment:
+            - { Name: APP_ENV, Value: !Ref EnvironmentName }
+            - { Name: DEPLOYMENT_TARGET, Value: ecs }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: DB_HOST, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbEndpoint" } }
+            - { Name: DB_PORT, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbPort" } }
+            - { Name: DB_NAME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbName" } }
+            # Only the ARN - the password itself is fetched at runtime with the task role
+            - { Name: DB_SECRET_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbSecretArn" } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+
+  # ================================================================ Load balancing (port 80 / 443 of the shared ALB)
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      Protocol: HTTP
+      Port: 8000
+      TargetType: instance
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbArn" }
+      Port: !Ref ListenerPort
+      Protocol: HTTP
+      DefaultActions: !If
+        - HasCert
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: !Ref HttpsListenerPort, StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref FrontendTargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbArn" }
+      Port: !Ref HttpsListenerPort
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  ApiRoutingRule:            # /api/*  -> Python backend, everything else -> Next.js
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasCert, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 10
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/api/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref BackendTargetGroup }]
+
+  # ================================================================ Services
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, ApiRoutingRule, ClusterCapacityProviders]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${EnvironmentName}-frontend
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref DesiredTasks
+      CapacityProviderStrategy: [{ CapacityProvider: !Ref CapacityProvider, Weight: 1 }]
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100       # rolling update: start new before stopping old
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }   # automatic rollback
+      PlacementStrategies:
+        - { Type: spread, Field: attribute:ecs.availability-zone }
+        - { Type: binpack, Field: memory }
+      LoadBalancers: [{ ContainerName: frontend, ContainerPort: 3000, TargetGroupArn: !Ref FrontendTargetGroup }]
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, ApiRoutingRule, ClusterCapacityProviders]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${EnvironmentName}-backend
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref DesiredTasks
+      CapacityProviderStrategy: [{ CapacityProvider: !Ref CapacityProvider, Weight: 1 }]
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      PlacementStrategies:
+        - { Type: spread, Field: attribute:ecs.availability-zone }
+        - { Type: binpack, Field: memory }
+      LoadBalancers: [{ ContainerName: backend, ContainerPort: 8000, TargetGroupArn: !Ref BackendTargetGroup }]
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+
+  # ================================================================ Service auto scaling (target tracking on CPU)
+  FrontendScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${Cluster}/${FrontendService.Name}
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+  FrontendScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cpu-target-tracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref FrontendScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+  BackendScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${Cluster}/${BackendService.Name}
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+  BackendScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cpu-target-tracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref BackendScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+  # ================================================================ Alarms
+  BackendUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-ecs-backend-unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }
+        - { Name: TargetGroup, Value: !GetAtt BackendTargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlertTopicArn" }]
+  FrontendUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-ecs-frontend-unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }
+        - { Name: TargetGroup, Value: !GetAtt FrontendTargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlertTopicArn" }]
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  FrontendServiceName:
+    Value: !GetAtt FrontendService.Name
+  BackendServiceName:
+    Value: !GetAtt BackendService.Name
+  AppUrl:
+    Description: Containerized deployment URL
+    Value: !If
+      - HasCert
+      - !Sub
+        - "https://${Dns}:${HttpsListenerPort}"
+        - Dns: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbDnsName" }
+      - !Sub
+        - "http://${Dns}:${ListenerPort}"
+        - Dns: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbDnsName" }

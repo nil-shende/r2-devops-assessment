@@ -1,0 +1,14 @@
+{
+  "_comment": "DEV - free-tier friendly: no NAT, single-AZ DB, 1 instance per compute type",
+  "network":    { "VpcCidr": "10.10.0.0/16", "NatGatewayMode": "none", "EnableFlowLogs": "false" },
+  "security":   { "AllowedIngressCidr": "0.0.0.0/0" },
+  "alb":        { "EnableDeletionProtection": "false", "EnableWaf": "false" },
+  "database":   { "DbInstanceClass": "db.t3.micro", "AllocatedStorage": "20", "MaxAllocatedStorage": "0",
+                  "MultiAz": "false", "BackupRetentionDays": "1", "DeletionProtection": "false" },
+  "monitoring": { "AlertEmail": "" },
+  "ecs":        { "InstanceType": "t3.micro", "MinHosts": "1", "MaxHosts": "2",
+                  "DesiredTasks": "1", "MinTasks": "1", "MaxTasks": "2",
+                  "CertificateArn": "", "ContainerInsights": "disabled", "LogRetentionDays": "7" },
+  "ec2":        { "InstanceType": "t3.micro", "MinSize": "1", "MaxSize": "2",
+                  "CertificateArn": "", "DeploymentConfigName": "CodeDeployDefault.AllAtOnce", "LogRetentionDays": "7" }
+}

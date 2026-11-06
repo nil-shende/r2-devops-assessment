@@ -1,0 +1,4 @@
+templates:
+  - infra/cloudformation/*.yaml
+ignore_checks:
+  - W6001   # outputs intentionally echo the imported ALB DNS name to print the app URL

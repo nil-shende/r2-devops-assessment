@@ -1,0 +1,14 @@
+{
+  "_comment": "PROD - highly available: NAT per AZ, Multi-AZ RDS, >= 2 of everything, WAF, deletion protection",
+  "network":    { "VpcCidr": "10.30.0.0/16", "NatGatewayMode": "per-az", "EnableFlowLogs": "true" },
+  "security":   { "AllowedIngressCidr": "0.0.0.0/0" },
+  "alb":        { "EnableDeletionProtection": "true", "EnableWaf": "true" },
+  "database":   { "DbInstanceClass": "db.t3.small", "AllocatedStorage": "20", "MaxAllocatedStorage": "100",
+                  "MultiAz": "true", "BackupRetentionDays": "7", "DeletionProtection": "true" },
+  "monitoring": { "AlertEmail": "" },
+  "ecs":        { "InstanceType": "t3.small", "MinHosts": "2", "MaxHosts": "6",
+                  "DesiredTasks": "2", "MinTasks": "2", "MaxTasks": "8",
+                  "CertificateArn": "", "ContainerInsights": "enabled", "LogRetentionDays": "30" },
+  "ec2":        { "InstanceType": "t3.small", "MinSize": "2", "MaxSize": "6",
+                  "CertificateArn": "", "DeploymentConfigName": "CodeDeployDefault.OneAtATime", "LogRetentionDays": "30" }
+}

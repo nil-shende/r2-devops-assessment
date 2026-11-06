@@ -1,0 +1,38 @@
+# Manual application rollback / promotion of any existing release (git SHA).
+# Leave image_tag empty to go back to the previous release recorded in SSM.
+name: App rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      image_tag:
+        description: "Release (git SHA) to deploy. Empty = previous release"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency: { group: "deploy-${{ inputs.environment }}", cancel-in-progress: false }
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || 'r2app' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APP_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Roll back
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: bash scripts/rollback-app.sh "$TARGET_ENV" "$IMAGE_TAG"

@@ -1,0 +1,21 @@
+[Unit]
+Description=R2 frontend (Next.js standalone server)
+After=network-online.target r2app-backend.service
+
+[Service]
+User=r2app
+Group=r2app
+WorkingDirectory=/opt/r2app/release/frontend
+EnvironmentFile=/etc/r2app/app.env
+EnvironmentFile=/opt/r2app/release/version.env
+Environment=NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1
+ExecStart=/usr/local/bin/node server.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+StandardOutput=append:/var/log/r2app/frontend.log
+StandardError=append:/var/log/r2app/frontend.log
+
+[Install]
+WantedBy=multi-user.target

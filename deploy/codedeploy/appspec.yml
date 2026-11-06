@@ -1,0 +1,29 @@
+# AWS CodeDeploy AppSpec for the NON-containerized deployment (EC2 Auto Scaling Group).
+# The bundle contains the pre-built Next.js standalone server and the Python source.
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/r2app/release
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:        # runs scripts from the PREVIOUS revision (if any)
+    - location: scripts/stop.sh
+      timeout: 60
+      runas: root
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 60
+      runas: root
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 600
+      runas: root
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 120
+      runas: root
+  ValidateService:        # failure here => deployment fails => automatic rollback
+    - location: scripts/validate.sh
+      timeout: 180
+      runas: root

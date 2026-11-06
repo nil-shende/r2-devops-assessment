@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 SECURITY: security groups that form the network "chain of trust"
+  Internet -> ALB -> app (ECS hosts / EC2 instances) -> PostgreSQL.
+  Each tier only accepts traffic from the security group of the tier in front of it.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Who may reach the load balancer (restrict to your office IP for a private demo)
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public load balancer
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: !Ref AllowedIngressCidr, Description: "HTTP  - containerized (ECS) app" }
+        - { IpProtocol: tcp, FromPort: 443,  ToPort: 443,  CidrIp: !Ref AllowedIngressCidr, Description: "HTTPS - containerized (ECS) app" }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref AllowedIngressCidr, Description: "HTTP  - non-containerized (EC2) app" }
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, CidrIp: !Ref AllowedIngressCidr, Description: "HTTPS - non-containerized (EC2) app" }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-alb-sg" }]
+
+  EcsHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS container instances (bridge networking, dynamic host ports)
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 32768
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Dynamic container ports - from ALB only
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-ecs-host-sg" }]
+
+  Ec2AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 instances running the apps directly (no containers)
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: Next.js from ALB only }
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: FastAPI from ALB only }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-ec2-app-sg" }]
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL - reachable only from the application tiers
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref EcsHostSecurityGroup, Description: From ECS backend }
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref Ec2AppSecurityGroup, Description: From EC2 backend }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32, Description: No outbound needed }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-db-sg" }]
+
+Outputs:
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-AlbSgId" }
+  EcsHostSecurityGroupId:
+    Value: !Ref EcsHostSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-EcsHostSgId" }
+  Ec2AppSecurityGroupId:
+    Value: !Ref Ec2AppSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-Ec2AppSgId" }
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbSgId" }

@@ -1,0 +1,14 @@
+{
+  "_comment": "STAGING - production-like topology at smaller scale",
+  "network":    { "VpcCidr": "10.20.0.0/16", "NatGatewayMode": "single", "EnableFlowLogs": "true" },
+  "security":   { "AllowedIngressCidr": "0.0.0.0/0" },
+  "alb":        { "EnableDeletionProtection": "false", "EnableWaf": "false" },
+  "database":   { "DbInstanceClass": "db.t3.micro", "AllocatedStorage": "20", "MaxAllocatedStorage": "50",
+                  "MultiAz": "false", "BackupRetentionDays": "3", "DeletionProtection": "false" },
+  "monitoring": { "AlertEmail": "" },
+  "ecs":        { "InstanceType": "t3.small", "MinHosts": "1", "MaxHosts": "3",
+                  "DesiredTasks": "2", "MinTasks": "2", "MaxTasks": "4",
+                  "CertificateArn": "", "ContainerInsights": "enabled", "LogRetentionDays": "14" },
+  "ec2":        { "InstanceType": "t3.small", "MinSize": "1", "MaxSize": "3",
+                  "CertificateArn": "", "DeploymentConfigName": "CodeDeployDefault.HalfAtATime", "LogRetentionDays": "14" }
+}

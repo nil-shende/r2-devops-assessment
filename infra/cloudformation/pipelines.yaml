@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 AWS-NATIVE CI/CD: two independent CodePipeline (V2) pipelines that are
+  triggered by FILE PATH filters on the GitHub repository:
+    * app pipeline   - runs only when apps/** or deploy/codedeploy/** change
+    * infra pipeline - runs only when infra/** changes
+  Builds/deployments run in CodeBuild using the same scripts as GitHub Actions.
+  Deploy this stack ONCE (account level) only if you want AWS-native CD.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  GitHubOwner: { Type: String }
+  GitHubRepo: { Type: String }
+  BranchName: { Type: String, Default: main }
+  ExistingConnectionArn:
+    Type: String
+    Default: ""
+    Description: Optional existing CodeConnections/CodeStar connection ARN to GitHub
+
+Conditions:
+  CreateConnection: !Equals [!Ref ExistingConnectionArn, ""]
+
+Resources:
+  # After the stack is created the connection is PENDING: open
+  # Developer Tools > Settings > Connections in the console and click "Update pending connection".
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Condition: CreateConnection
+    Properties:
+      ConnectionName: !Sub ${ProjectName}-github
+      ProviderType: GitHub
+
+  # ---------------------------------------------------------------- CodeBuild roles (reuse the shared least-privilege policies)
+  AppCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns: [{ "Fn::ImportValue": !Sub "${ProjectName}-shared-AppDeployPolicyArn" }]
+      Policies:
+        - PolicyName: codebuild-basics
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub
+                  - "${Bucket}/${ProjectName}-*"
+                  - Bucket: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+
+  InfraCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns: [{ "Fn::ImportValue": !Sub "${ProjectName}-shared-InfraDeployPolicyArn" }]
+      Policies:
+        - PolicyName: codebuild-basics
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub
+                  - "${Bucket}/${ProjectName}-*"
+                  - Bucket: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+
+  # ---------------------------------------------------------------- CodeBuild projects
+  AppBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-app-build
+      ServiceRole: !GetAtt AppCodeBuildRole.Arn
+      Source: { Type: CODEPIPELINE, BuildSpec: ci/buildspec-app-build.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true            # required for docker build
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+      TimeoutInMinutes: 30
+
+  AppDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-app-deploy
+      ServiceRole: !GetAtt AppCodeBuildRole.Arn
+      Source: { Type: CODEPIPELINE, BuildSpec: ci/buildspec-app-deploy.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+      TimeoutInMinutes: 60
+
+  InfraProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-infra-deploy
+      ServiceRole: !GetAtt InfraCodeBuildRole.Arn
+      Source: { Type: CODEPIPELINE, BuildSpec: ci/buildspec-infra.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+      TimeoutInMinutes: 90
+
+  # ---------------------------------------------------------------- Pipeline role
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - { Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+                  - !Sub
+                    - "${Bucket}/${ProjectName}-*"
+                    - Bucket: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt AppBuildProject.Arn, !GetAtt AppDeployProject.Arn, !GetAtt InfraProject.Arn]
+              - Effect: Allow
+                Action: [codestar-connections:UseConnection, codeconnections:UseConnection]
+                Resource: !If [CreateConnection, !Ref GitHubConnection, !Ref ExistingConnectionArn]
+
+  # ================================================================ APPLICATION pipeline
+  AppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-app
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucket" }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["apps/**", "deploy/codedeploy/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              Namespace: SourceVariables
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !If [CreateConnection, !Ref GitHubConnection, !Ref ExistingConnectionArn]
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref BranchName
+                DetectChanges: "false"   # the filtered trigger above starts the pipeline
+              OutputArtifacts: [{ Name: Src }]
+        - Name: Build
+          Actions:
+            - Name: TestBuildPush
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref AppBuildProject
+                EnvironmentVariables: '[{"name":"IMAGE_TAG","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Dev
+          Actions:
+            - Name: DeployDev
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref AppDeployProject
+                EnvironmentVariables: '[{"name":"TARGET_ENV","value":"dev","type":"PLAINTEXT"},{"name":"IMAGE_TAG","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Staging
+          Actions:
+            - Name: Approve
+              RunOrder: 1
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration: { CustomData: "Promote this release to STAGING?" }
+            - Name: DeployStaging
+              RunOrder: 2
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref AppDeployProject
+                EnvironmentVariables: '[{"name":"TARGET_ENV","value":"staging","type":"PLAINTEXT"},{"name":"IMAGE_TAG","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Prod
+          Actions:
+            - Name: Approve
+              RunOrder: 1
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration: { CustomData: "Promote this release to PRODUCTION?" }
+            - Name: DeployProd
+              RunOrder: 2
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref AppDeployProject
+                EnvironmentVariables: '[{"name":"TARGET_ENV","value":"prod","type":"PLAINTEXT"},{"name":"IMAGE_TAG","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+
+  # ================================================================ INFRASTRUCTURE pipeline
+  InfraPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-infra
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucket" }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["infra/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !If [CreateConnection, !Ref GitHubConnection, !Ref ExistingConnectionArn]
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: Src }]
+        - Name: Validate
+          Actions:
+            - Name: LintAndValidate
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref InfraProject
+                EnvironmentVariables: '[{"name":"ACTION","value":"validate","type":"PLAINTEXT"},{"name":"TARGET_ENV","value":"dev","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Dev
+          Actions:
+            - Name: DeployDev
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref InfraProject
+                EnvironmentVariables: '[{"name":"ACTION","value":"deploy","type":"PLAINTEXT"},{"name":"TARGET_ENV","value":"dev","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Staging
+          Actions:
+            - Name: Approve
+              RunOrder: 1
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration: { CustomData: "Apply infrastructure changes to STAGING?" }
+            - Name: DeployStaging
+              RunOrder: 2
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref InfraProject
+                EnvironmentVariables: '[{"name":"ACTION","value":"deploy","type":"PLAINTEXT"},{"name":"TARGET_ENV","value":"staging","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+        - Name: Prod
+          Actions:
+            - Name: Approve
+              RunOrder: 1
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration: { CustomData: "Apply infrastructure changes to PRODUCTION? Review the change sets in the Staging logs first." }
+            - Name: DeployProd
+              RunOrder: 2
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref InfraProject
+                EnvironmentVariables: '[{"name":"ACTION","value":"deploy","type":"PLAINTEXT"},{"name":"TARGET_ENV","value":"prod","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: Src }]
+
+Outputs:
+  ConnectionArn:
+    Description: Must be activated once in the console (status PENDING -> AVAILABLE)
+    Value: !If [CreateConnection, !Ref GitHubConnection, !Ref ExistingConnectionArn]
+  AppPipelineUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${ProjectName}-app/view
+  InfraPipelineUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${ProjectName}-infra/view

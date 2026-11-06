@@ -1,0 +1,95 @@
+# INFRASTRUCTURE pipeline (GitHub Actions).
+# Triggered ONLY by infra paths. Every environment gets a change-set PLAN
+# (shown in the job summary) before APPLY; staging and prod apply jobs wait for
+# approval through GitHub Environment protection rules.
+# Application code is never built or deployed here.
+name: Infra deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "scripts/deploy-infra.sh"
+      - "scripts/lib.sh"
+      - ".github/workflows/infra-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'r2app' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install cfn-lint
+      - run: bash scripts/validate-templates.sh
+
+  dev:
+    needs: validate
+    if: vars.CD_PROVIDER != 'aws'
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: { group: deploy-dev, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_INFRA_DEPLOY_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - run: bash scripts/deploy-infra.sh dev plan
+      - run: bash scripts/deploy-infra.sh dev apply
+
+  plan-staging:
+    # only runs once you add 'staging' to the repo variable ENABLED_ENVIRONMENTS (default: dev only, to stay in free tier)
+    if: contains(vars.ENABLED_ENVIRONMENTS || 'dev', 'staging')
+    needs: dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_INFRA_DEPLOY_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - run: bash scripts/deploy-infra.sh staging plan
+
+  apply-staging:
+    # only runs once you add 'staging' to the repo variable ENABLED_ENVIRONMENTS (default: dev only, to stay in free tier)
+    if: contains(vars.ENABLED_ENVIRONMENTS || 'dev', 'staging')
+    needs: plan-staging
+    runs-on: ubuntu-latest
+    environment: staging                 # approval gate - reviewer reads the plan above first
+    concurrency: { group: deploy-staging, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_INFRA_DEPLOY_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - run: bash scripts/deploy-infra.sh staging apply
+
+  plan-prod:
+    # only runs once you add 'prod' to the repo variable ENABLED_ENVIRONMENTS (default: dev only, to stay in free tier)
+    if: contains(vars.ENABLED_ENVIRONMENTS || 'dev', 'prod')
+    needs: apply-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_INFRA_DEPLOY_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - run: bash scripts/deploy-infra.sh prod plan
+
+  apply-prod:
+    # only runs once you add 'prod' to the repo variable ENABLED_ENVIRONMENTS (default: dev only, to stay in free tier)
+    if: contains(vars.ENABLED_ENVIRONMENTS || 'dev', 'prod')
+    needs: plan-prod
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency: { group: deploy-prod, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_INFRA_DEPLOY_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - run: bash scripts/deploy-infra.sh prod apply

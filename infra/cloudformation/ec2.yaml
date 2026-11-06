@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 COMPUTE - NON-CONTAINERIZED: EC2 Auto Scaling group running Next.js (Node)
+  and FastAPI (Python) directly as systemd services, deployed by AWS CodeDeploy.
+  Exposed on port 8080 (8443 with a certificate) of the shared ALB.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  MinSize: { Type: Number, Default: 1 }
+  MaxSize: { Type: Number, Default: 2 }
+  NodeMajorVersion:
+    Type: String
+    Default: "22"
+  ListenerPort: { Type: Number, Default: 8080 }
+  HttpsListenerPort: { Type: Number, Default: 8443 }
+  CertificateArn:
+    Type: String
+    Default: ""
+  DeploymentConfigName:
+    Type: String
+    Default: CodeDeployDefault.AllAtOnce
+    AllowedValues: [CodeDeployDefault.AllAtOnce, CodeDeployDefault.HalfAtATime, CodeDeployDefault.OneAtATime]
+  LogRetentionDays: { Type: Number, Default: 14 }
+
+Conditions:
+  HasCert: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # ================================================================ IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-ec2-app-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager instead of SSH
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: app-runtime
+          PolicyDocument:
+            Statement:
+              - Sid: ReadDeploymentBundles
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub
+                  - "${Bucket}/ec2/*"
+                  - Bucket: { "Fn::ImportValue": !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbSecretArn" }
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/${EnvironmentName}/ec2/backend
+      RetentionInDays: !Ref LogRetentionDays
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/${EnvironmentName}/ec2/frontend
+      RetentionInDays: !Ref LogRetentionDays
+  CodeDeployAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/${EnvironmentName}/ec2/codedeploy-agent
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ================================================================ Launch template: runtime only, NO application code
+  # The instance gets Node.js, Python, the CodeDeploy agent and the CloudWatch
+  # agent. The application itself always arrives through CodeDeploy, so an
+  # application release never requires touching this template.
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-Ec2AppSgId" }]
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1 }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 10, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-ec2-app" }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/user-data.log) 2>&1
+              dnf install -y aws-cfn-bootstrap
+              # Tell CloudFormation if bootstrapping failed (otherwise it waits for the success signal below)
+              trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region} || true' ERR
+
+              # ---- runtimes ----
+              dnf install -y python3.11 python3.11-pip ruby wget tar xz amazon-cloudwatch-agent
+
+              # Node.js LTS from nodejs.org, verified against the published SHA256 list
+              BASE="https://nodejs.org/dist/latest-v${NodeMajorVersion}.x"
+              cd /tmp
+              curl -fsSL "$BASE/SHASUMS256.txt" -o SHASUMS256.txt
+              FILE=$(awk '/linux-x64\.tar\.xz$/ {print $2}' SHASUMS256.txt)
+              curl -fsSLO "$BASE/$FILE"
+              grep " $FILE\$" SHASUMS256.txt | sha256sum -c -
+              tar -xJf "$FILE" -C /usr/local --strip-components=1
+              node --version
+
+              # ---- non-secret runtime configuration (secrets are fetched by the app from Secrets Manager) ----
+              mkdir -p /etc/r2app /var/log/r2app
+              cat > /etc/r2app/app.env <<EOF
+              APP_ENV=${EnvironmentName}
+              DEPLOYMENT_TARGET=ec2
+              AWS_REGION=${AWS::Region}
+              DB_HOST=${DbHost}
+              DB_PORT=${DbPort}
+              DB_NAME=${DbName}
+              DB_SECRET_ARN=${DbSecretArn}
+              EOF
+              chmod 0644 /etc/r2app/app.env
+
+              # ---- CloudWatch agent: ship app logs + memory/disk metrics ----
+              cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
+              {
+                "agent": { "run_as_user": "root" },
+                "logs": { "logs_collected": { "files": { "collect_list": [
+                  { "file_path": "/var/log/r2app/backend.log",  "log_group_name": "/${ProjectName}/${EnvironmentName}/ec2/backend",  "log_stream_name": "{instance_id}" },
+                  { "file_path": "/var/log/r2app/frontend.log", "log_group_name": "/${ProjectName}/${EnvironmentName}/ec2/frontend", "log_stream_name": "{instance_id}" },
+                  { "file_path": "/var/log/aws/codedeploy-agent/codedeploy-agent.log", "log_group_name": "/${ProjectName}/${EnvironmentName}/ec2/codedeploy-agent", "log_stream_name": "{instance_id}" }
+                ] } } },
+                "metrics": {
+                  "namespace": "${ProjectName}/${EnvironmentName}/ec2",
+                  "append_dimensions": { "AutoScalingGroupName": "${!aws:AutoScalingGroupName}" },
+                  "metrics_collected": {
+                    "mem":  { "measurement": ["mem_used_percent"] },
+                    "disk": { "measurement": ["used_percent"], "resources": ["/"] }
+                  }
+                }
+              }
+              EOF
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+              # ---- CodeDeploy agent (installed LAST so the runtime is ready before the first deployment hook) ----
+              wget -q "https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install" -O /tmp/codedeploy-install
+              chmod +x /tmp/codedeploy-install
+              /tmp/codedeploy-install auto
+              systemctl enable --now codedeploy-agent
+
+              # Instance is ready for CodeDeploy -> signal CloudFormation (no-op for later scale-out instances)
+              /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region} || true
+            - DbHost: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbEndpoint" }
+              DbPort: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbPort" }
+              DbName: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbName" }
+              DbSecretArn: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbSecretArn" }
+
+  # ================================================================ Load balancing (port 8080 / 8443 of the shared ALB)
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "30" }]
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-VpcId" }
+      Protocol: HTTP
+      Port: 8000
+      TargetType: instance
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "30" }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbArn" }
+      Port: !Ref ListenerPort
+      Protocol: HTTP
+      DefaultActions: !If
+        - HasCert
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: !Ref HttpsListenerPort, StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref FrontendTargetGroup
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbArn" }
+      Port: !Ref HttpsListenerPort
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref FrontendTargetGroup }]
+  ApiRoutingRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasCert, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 10
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/api/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref BackendTargetGroup }]
+
+  # ================================================================ Auto Scaling group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    # Stack creation waits until every initial instance has installed its runtimes
+    # and the CodeDeploy agent (cfn-signal in user data), so the first app
+    # deployment never races an instance that is still bootstrapping.
+    CreationPolicy:
+      ResourceSignal: { Count: !Ref MinSize, Timeout: PT15M }
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${EnvironmentName}-ec2-asg
+      VPCZoneIdentifier: !Split [",", { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-ComputeSubnetIds" }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      TargetGroupARNs: [!Ref FrontendTargetGroup, !Ref BackendTargetGroup]
+      # EC2 (not ELB) health checks: a brand-new instance has no app until its
+      # first CodeDeploy deployment and would otherwise be replaced in a loop.
+      # Unhealthy app processes are still taken out of rotation by the ALB.
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      MetricsCollection: [{ Granularity: 1Minute }]
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 60
+
+  # ================================================================ CodeDeploy
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole]
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${ProjectName}-${EnvironmentName}-ec2
+      ComputePlatform: Server
+
+  Backend5xxAlarm:     # used by CodeDeploy to stop + roll back a bad release
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-ec2-backend-5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }
+        - { Name: TargetGroup, Value: !GetAtt BackendTargetGroup.TargetGroupFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlertTopicArn" }]
+
+  Ec2UnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-ec2-backend-unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }
+        - { Name: TargetGroup, Value: !GetAtt BackendTargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlertTopicArn" }]
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub ${ProjectName}-${EnvironmentName}-ec2-dg
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups: [!Ref AutoScalingGroup]   # new instances automatically get the last good release
+      DeploymentConfigName: !Ref DeploymentConfigName
+      DeploymentStyle: { DeploymentType: IN_PLACE, DeploymentOption: WITH_TRAFFIC_CONTROL }
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt FrontendTargetGroup.TargetGroupName
+          - Name: !GetAtt BackendTargetGroup.TargetGroupName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]
+      AlarmConfiguration:
+        Enabled: true
+        Alarms: [{ Name: !Ref Backend5xxAlarm }]
+
+Outputs:
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  CodeDeployDeploymentGroupName:
+    Value: !Ref CodeDeployDeploymentGroup
+  AppUrl:
+    Description: Non-containerized deployment URL
+    Value: !If
+      - HasCert
+      - !Sub
+        - "https://${Dns}:${HttpsListenerPort}"
+        - Dns: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbDnsName" }
+      - !Sub
+        - "http://${Dns}:${ListenerPort}"
+        - Dns: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbDnsName" }

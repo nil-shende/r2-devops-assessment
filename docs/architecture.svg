@@ -1,0 +1,238 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1200" width="1600" height="1200" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#37474f"/>
+    </marker>
+    <marker id="ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8e24aa"/>
+    </marker>
+    <style>
+      .t  { font-size: 15px; font-weight: 700; fill: #1c2430; }
+      .s  { font-size: 12.5px; fill: #37474f; }
+      .xs { font-size: 11.5px; fill: #546e7a; }
+      .h  { font-size: 13px; font-weight: 700; letter-spacing: .04em; fill: #546e7a; }
+      .ln { stroke: #37474f; stroke-width: 2; fill: none; marker-end: url(#a); }
+      .dl { stroke: #8e24aa; stroke-width: 1.6; stroke-dasharray: 6 4; fill: none; marker-end: url(#ad); }
+      .lbl{ font-size: 11.5px; font-weight: 700; fill: #263238; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1200" fill="#ffffff"/>
+  <text x="20" y="34" font-size="22" font-weight="700" fill="#1c2430">R2 DevOps Assessment - AWS architecture (one environment: dev / staging / prod)</text>
+
+  <!-- ===================== left: users + developers ===================== -->
+  <rect x="20" y="200" width="225" height="84" rx="10" fill="#eceff1" stroke="#90a4ae"/>
+  <text x="132" y="232" text-anchor="middle" class="t">End users</text>
+  <text x="132" y="254" text-anchor="middle" class="s">Browser (HTTPS)</text>
+  <text x="132" y="272" text-anchor="middle" class="xs">same origin: / and /api/*</text>
+
+  <rect x="20" y="820" width="225" height="78" rx="10" fill="#eceff1" stroke="#90a4ae"/>
+  <text x="132" y="850" text-anchor="middle" class="t">GitHub repository</text>
+  <text x="132" y="870" text-anchor="middle" class="s">apps/**   infra/**</text>
+  <text x="132" y="887" text-anchor="middle" class="xs">path filters split the pipelines</text>
+
+  <rect x="20" y="925" width="225" height="110" rx="10" fill="#e8eaf6" stroke="#5c6bc0"/>
+  <text x="132" y="953" text-anchor="middle" class="t">GitHub Actions</text>
+  <text x="132" y="974" text-anchor="middle" class="s">CI: tests, lint, docker build</text>
+  <text x="132" y="992" text-anchor="middle" class="s">CD: app-deploy / infra-deploy</text>
+  <text x="132" y="1012" text-anchor="middle" class="xs">OIDC -> short-lived IAM role</text>
+  <text x="132" y="1027" text-anchor="middle" class="xs">(no stored AWS keys)</text>
+  <path class="ln" d="M132,898 V925"/>
+
+  <!-- ===================== AWS cloud ===================== -->
+  <rect x="268" y="52" width="1312" height="1130" rx="14" fill="#fafafa" stroke="#232f3e" stroke-width="2"/>
+  <text x="288" y="78" class="h">AWS CLOUD  ·  REGION ap-south-1</text>
+
+  <!-- VPC -->
+  <rect x="288" y="92" width="852" height="1040" rx="10" fill="#ffffff" stroke="#7b1fa2" stroke-width="2"/>
+  <text x="304" y="116" class="h" fill="#7b1fa2">VPC 10.x0.0.0/16 - 2 AZs x 3 subnet tiers</text>
+
+  <!-- AZ columns -->
+  <rect x="304" y="128" width="404" height="990" rx="8" fill="none" stroke="#90a4ae" stroke-dasharray="8 5"/>
+  <text x="318" y="148" class="h">AVAILABILITY ZONE A</text>
+  <rect x="724" y="128" width="404" height="990" rx="8" fill="none" stroke="#90a4ae" stroke-dasharray="8 5"/>
+  <text x="738" y="148" class="h">AVAILABILITY ZONE B</text>
+
+  <!-- Internet gateway -->
+  <rect x="640" y="76" width="160" height="32" rx="6" fill="#ede7f6" stroke="#7b1fa2"/>
+  <text x="720" y="97" text-anchor="middle" class="lbl">Internet Gateway</text>
+
+  <!-- public subnets -->
+  <rect x="316" y="160" width="380" height="200" rx="6" fill="#e8f5e9" stroke="#43a047"/>
+  <text x="328" y="178" class="xs">Public subnet A  10.x0.0.0/24</text>
+  <rect x="736" y="160" width="380" height="200" rx="6" fill="#e8f5e9" stroke="#43a047"/>
+  <text x="748" y="178" class="xs">Public subnet B  10.x0.1.0/24</text>
+
+  <rect x="400" y="196" width="640" height="104" rx="10" fill="#ffffff" stroke="#7b1fa2" stroke-width="2"/>
+  <text x="720" y="222" text-anchor="middle" class="t">Application Load Balancer (internet-facing, both AZs)</text>
+  <text x="720" y="244" text-anchor="middle" class="s">:80 / :443  ->  containerized app (ECS)      :8080 / :8443  ->  non-containerized app (EC2)</text>
+  <text x="720" y="264" text-anchor="middle" class="s">rule  /api/*  ->  backend target group      default  /*  ->  frontend target group</text>
+  <text x="720" y="285" text-anchor="middle" class="xs">health checks /healthz and /api/health  ·  ACM TLS cert (optional)  ·  AWS WAF (prod)</text>
+
+  <rect x="330" y="312" width="200" height="38" rx="6" fill="#fff" stroke="#43a047" stroke-dasharray="5 3"/>
+  <text x="430" y="336" text-anchor="middle" class="xs">NAT Gateway A (staging / prod)</text>
+  <rect x="750" y="312" width="200" height="38" rx="6" fill="#fff" stroke="#43a047" stroke-dasharray="5 3"/>
+  <text x="850" y="336" text-anchor="middle" class="xs">NAT Gateway B (prod only)</text>
+
+  <!-- app subnets -->
+  <rect x="316" y="378" width="380" height="440" rx="6" fill="#e3f2fd" stroke="#1e88e5"/>
+  <text x="328" y="396" class="xs">App subnet A  10.x0.2.0/24  (private; public in dev = no NAT)</text>
+  <rect x="736" y="378" width="380" height="440" rx="6" fill="#e3f2fd" stroke="#1e88e5"/>
+  <text x="748" y="396" class="xs">App subnet B  10.x0.3.0/24</text>
+
+  <!-- ECS host A -->
+  <rect x="332" y="410" width="348" height="180" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-width="1.8"/>
+  <text x="346" y="432" class="t">ECS container instance</text>
+  <text x="346" y="450" class="xs">EC2 ASG + ECS capacity provider (containerized)</text>
+  <rect x="346" y="464" width="156" height="58" rx="6" fill="#fff" stroke="#ef6c00"/>
+  <text x="424" y="487" text-anchor="middle" class="lbl">frontend task</text>
+  <text x="424" y="506" text-anchor="middle" class="xs">Next.js :3000</text>
+  <rect x="512" y="464" width="156" height="58" rx="6" fill="#fff" stroke="#ef6c00"/>
+  <text x="590" y="487" text-anchor="middle" class="lbl">backend task</text>
+  <text x="590" y="506" text-anchor="middle" class="xs">FastAPI :8000</text>
+  <text x="346" y="546" class="xs">bridge mode, dynamic host ports, IMDSv2 hop=1</text>
+  <text x="346" y="563" class="xs">rolling deploy + circuit-breaker auto-rollback</text>
+  <text x="346" y="580" class="xs">logs: awslogs -> CloudWatch</text>
+
+  <!-- EC2 app A -->
+  <rect x="332" y="610" width="348" height="190" rx="8" fill="#fbe9e7" stroke="#d84315" stroke-width="1.8"/>
+  <text x="346" y="632" class="t">EC2 app instance</text>
+  <text x="346" y="650" class="xs">EC2 ASG + CodeDeploy (non-containerized)</text>
+  <rect x="346" y="664" width="156" height="58" rx="6" fill="#fff" stroke="#d84315"/>
+  <text x="424" y="687" text-anchor="middle" class="lbl">Next.js</text>
+  <text x="424" y="706" text-anchor="middle" class="xs">systemd :3000</text>
+  <rect x="512" y="664" width="156" height="58" rx="6" fill="#fff" stroke="#d84315"/>
+  <text x="590" y="687" text-anchor="middle" class="lbl">FastAPI (uvicorn)</text>
+  <text x="590" y="706" text-anchor="middle" class="xs">systemd :8000</text>
+  <text x="346" y="746" class="xs">Node 22 + Python 3.11 installed by user data</text>
+  <text x="346" y="763" class="xs">CodeDeploy in-place + ALB traffic control</text>
+  <text x="346" y="780" class="xs">CloudWatch agent: logs + mem/disk metrics</text>
+
+  <!-- ECS host B -->
+  <rect x="752" y="410" width="348" height="180" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-width="1.8"/>
+  <text x="766" y="432" class="t">ECS container instance</text>
+  <text x="766" y="450" class="xs">scales out with tasks (min 2 in prod)</text>
+  <rect x="766" y="464" width="156" height="58" rx="6" fill="#fff" stroke="#ef6c00"/>
+  <text x="844" y="487" text-anchor="middle" class="lbl">frontend task</text>
+  <text x="844" y="506" text-anchor="middle" class="xs">Next.js :3000</text>
+  <rect x="932" y="464" width="156" height="58" rx="6" fill="#fff" stroke="#ef6c00"/>
+  <text x="1010" y="487" text-anchor="middle" class="lbl">backend task</text>
+  <text x="1010" y="506" text-anchor="middle" class="xs">FastAPI :8000</text>
+  <text x="766" y="546" class="xs">task placement: spread across AZs</text>
+  <text x="766" y="563" class="xs">service auto scaling: CPU target 60%</text>
+
+  <!-- EC2 app B -->
+  <rect x="752" y="610" width="348" height="190" rx="8" fill="#fbe9e7" stroke="#d84315" stroke-width="1.8"/>
+  <text x="766" y="632" class="t">EC2 app instance</text>
+  <text x="766" y="650" class="xs">ASG target tracking: CPU 60%</text>
+  <rect x="766" y="664" width="156" height="58" rx="6" fill="#fff" stroke="#d84315"/>
+  <text x="844" y="687" text-anchor="middle" class="lbl">Next.js</text>
+  <text x="844" y="706" text-anchor="middle" class="xs">systemd :3000</text>
+  <rect x="932" y="664" width="156" height="58" rx="6" fill="#fff" stroke="#d84315"/>
+  <text x="1010" y="687" text-anchor="middle" class="lbl">FastAPI (uvicorn)</text>
+  <text x="1010" y="706" text-anchor="middle" class="xs">systemd :8000</text>
+  <text x="766" y="746" class="xs">new instances get the last good release</text>
+  <text x="766" y="763" class="xs">automatically (CodeDeploy ASG hook)</text>
+
+  <!-- data subnets -->
+  <rect x="316" y="836" width="380" height="270" rx="6" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="328" y="854" class="xs">Data subnet A  10.x0.4.0/24  (no internet route)</text>
+  <rect x="736" y="836" width="380" height="270" rx="6" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="748" y="854" class="xs">Data subnet B  10.x0.5.0/24  (no internet route)</text>
+
+  <rect x="352" y="930" width="310" height="128" rx="10" fill="#fff" stroke="#3949ab" stroke-width="2"/>
+  <text x="507" y="958" text-anchor="middle" class="t">Amazon RDS PostgreSQL 16</text>
+  <text x="507" y="979" text-anchor="middle" class="s">primary  ·  db.t3.micro (dev)</text>
+  <text x="507" y="998" text-anchor="middle" class="xs">storage encrypted · rds.force_ssl=1</text>
+  <text x="507" y="1015" text-anchor="middle" class="xs">automated backups · final snapshot on delete</text>
+  <text x="507" y="1032" text-anchor="middle" class="xs">SG: 5432 only from app security groups</text>
+
+  <rect x="772" y="930" width="310" height="128" rx="10" fill="#fff" stroke="#3949ab" stroke-dasharray="6 4"/>
+  <text x="927" y="968" text-anchor="middle" class="t">RDS standby</text>
+  <text x="927" y="990" text-anchor="middle" class="s">Multi-AZ (prod) - automatic failover</text>
+  <text x="927" y="1010" text-anchor="middle" class="xs">same DNS endpoint after failover</text>
+  <path d="M662,994 H772" stroke="#3949ab" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
+  <text x="717" y="986" text-anchor="middle" class="xs">sync</text>
+
+  <!-- ===================== traffic arrows ===================== -->
+  <path class="ln" d="M245,242 H400"/>
+  <text x="322" y="234" text-anchor="middle" class="lbl">HTTPS</text>
+  <path d="M720,108 V196" stroke="#7b1fa2" stroke-width="2" fill="none"/>
+
+  <path class="ln" d="M610,300 V410"/>
+  <text x="618" y="372" class="lbl">:80</text>
+  <path class="ln" d="M1030,300 V410"/>
+  <text x="1038" y="372" class="lbl">:80</text>
+
+  <path d="M716,300 V693" stroke="#37474f" stroke-width="2" fill="none"/>
+  <path class="ln" d="M716,693 H668"/>
+  <path class="ln" d="M716,693 H766"/>
+  <text x="722" y="372" class="lbl">:8080</text>
+
+  <path class="ln" d="M640,722 V930"/>
+  <text x="592" y="912" text-anchor="end" class="lbl">5432 / TLS</text>
+  <path class="ln" d="M1010,722 V880 H600 V930"/>
+
+  <!-- ===================== right: regional services ===================== -->
+  <text x="1160" y="116" class="h">SECURITY &amp; CONFIGURATION</text>
+  <rect x="1160" y="128" width="400" height="62" rx="8" fill="#fce4ec" stroke="#c2185b"/>
+  <text x="1176" y="152" class="t">AWS Secrets Manager</text>
+  <text x="1176" y="172" class="xs">DB credentials created + rotated by RDS; read at runtime</text>
+  <rect x="1160" y="200" width="400" height="62" rx="8" fill="#fce4ec" stroke="#c2185b"/>
+  <text x="1176" y="224" class="t">SSM Parameter Store</text>
+  <text x="1176" y="244" class="xs">/r2app/&lt;env&gt;/release/image-tag (owned by app pipeline)</text>
+  <rect x="1160" y="272" width="400" height="62" rx="8" fill="#fce4ec" stroke="#c2185b"/>
+  <text x="1176" y="296" class="t">AWS IAM</text>
+  <text x="1176" y="316" class="xs">task / instance roles, separate app vs infra deploy roles</text>
+  <rect x="1160" y="344" width="400" height="62" rx="8" fill="#fce4ec" stroke="#c2185b"/>
+  <text x="1176" y="368" class="t">AWS WAF (prod)</text>
+  <text x="1176" y="388" class="xs">managed rule groups + per-IP rate limit on the ALB</text>
+
+  <text x="1160" y="442" class="h">OBSERVABILITY</text>
+  <rect x="1160" y="454" width="400" height="62" rx="8" fill="#e0f2f1" stroke="#00897b"/>
+  <text x="1176" y="478" class="t">Amazon CloudWatch</text>
+  <text x="1176" y="498" class="xs">logs · metrics · alarms · dashboard · Container Insights</text>
+  <rect x="1160" y="526" width="400" height="62" rx="8" fill="#e0f2f1" stroke="#00897b"/>
+  <text x="1176" y="550" class="t">Amazon SNS</text>
+  <text x="1176" y="570" class="xs">alarm notifications (e-mail)</text>
+
+  <text x="1160" y="626" class="h">DELIVERY (BUILD ONCE, DEPLOY MANY)</text>
+  <rect x="1160" y="638" width="400" height="62" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="1176" y="662" class="t">Amazon ECR</text>
+  <text x="1176" y="682" class="xs">immutable images tagged with git SHA, scan on push</text>
+  <rect x="1160" y="710" width="400" height="62" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="1176" y="734" class="t">Amazon S3 - artifacts</text>
+  <text x="1176" y="754" class="xs">CodeDeploy bundles ec2/&lt;sha&gt;.zip, pipeline artifacts</text>
+  <rect x="1160" y="782" width="400" height="62" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="1176" y="806" class="t">AWS CodeDeploy</text>
+  <text x="1176" y="826" class="xs">EC2 releases, auto-rollback on failure / alarm</text>
+  <rect x="1160" y="854" width="400" height="62" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="1176" y="878" class="t">AWS CloudFormation</text>
+  <text x="1176" y="898" class="xs">7 stacks per env + shared stack; change sets</text>
+  <rect x="1160" y="926" width="400" height="80" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="1176" y="950" class="t">AWS CodePipeline (V2) + CodeBuild</text>
+  <text x="1176" y="970" class="xs">app pipeline: trigger apps/**      infra pipeline: infra/**</text>
+  <text x="1176" y="988" class="xs">manual approval before staging and prod</text>
+
+  <!-- service links -->
+  <path class="dl" d="M1100,500 H1130 V160 H1160"/>
+  <text x="1124" y="330" text-anchor="middle" class="xs" fill="#8e24aa" transform="rotate(-90 1124 330)">GetSecretValue (task / instance role)</text>
+  <path class="dl" d="M1160,669 H1140 V570 H1100"/>
+  <text x="1104" y="600" class="xs" fill="#8e24aa">image pull</text>
+  <path class="dl" d="M1160,813 H1140 V760 H1100"/>
+  <text x="1104" y="790" class="xs" fill="#8e24aa">bundle</text>
+
+  <!-- github -> delivery -->
+  <path class="ln" d="M245,980 H258 V1160 H1150 V966 H1160"/>
+  <text x="700" y="1152" text-anchor="middle" class="lbl">OIDC: push images + bundles, deploy releases, apply CloudFormation change sets</text>
+
+  <!-- legend -->
+  <rect x="1160" y="1030" width="400" height="92" rx="8" fill="#fff" stroke="#cfd8dc"/>
+  <text x="1176" y="1052" class="h">LEGEND</text>
+  <path class="ln" d="M1176,1072 H1226"/>
+  <text x="1236" y="1076" class="xs">request / network traffic</text>
+  <path class="dl" d="M1176,1094 H1226"/>
+  <text x="1236" y="1098" class="xs">AWS API call made with an IAM role</text>
+  <rect x="1176" y="1106" width="40" height="10" fill="#fff" stroke="#43a047" stroke-dasharray="5 3"/>
+  <text x="1236" y="1116" class="xs">optional per environment</text>
+</svg>

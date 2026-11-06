@@ -1,0 +1,9 @@
+# CodePipeline "app" pipeline - Dev / Staging / Prod stages (TARGET_ENV set per action).
+# Ships an already-built release; never touches CloudFormation.
+version: 0.2
+env:
+  shell: bash
+phases:
+  build:
+    commands:
+      - bash scripts/deploy-app.sh "${TARGET_ENV}" "${IMAGE_TAG}"

@@ -1,0 +1,19 @@
+# CodePipeline "infra" pipeline. ACTION=validate | deploy, TARGET_ENV=dev|staging|prod.
+version: 0.2
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet cfn-lint
+  build:
+    commands:
+      - |
+        if [ "${ACTION}" = "validate" ]; then
+          VALIDATE_WITH_AWS=true bash scripts/validate-templates.sh
+        else
+          bash scripts/deploy-infra.sh "${TARGET_ENV}" plan     # change sets are printed in the build log
+          bash scripts/deploy-infra.sh "${TARGET_ENV}" apply
+        fi

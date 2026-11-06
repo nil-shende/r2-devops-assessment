@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 SHARED (account-level, deployed ONCE): ECR repositories, artifact bucket,
+  GitHub OIDC trust, least-privilege deploy policies and the CloudFormation
+  execution role. Shared by dev / staging / prod so the SAME image is promoted
+  through every environment ("build once, deploy many").
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: r2app
+    AllowedPattern: "^[a-z][a-z0-9-]{1,14}$"
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the repository
+  GitHubRepo:
+    Type: String
+    Description: Repository name (without owner)
+  CreateGitHubOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if the account already has token.actions.githubusercontent.com as an OIDC provider
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+
+Resources:
+  # ------------------------------------------------------------------ ECR
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}/frontend
+      ImageTagMutability: IMMUTABLE          # a tag (= git SHA) can never be overwritten
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 30 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},
+            "action":{"type":"expire"}}]}
+      EmptyOnDelete: true
+
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}/backend
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 30 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},
+            "action":{"type":"expire"}}]}
+      EmptyOnDelete: true
+
+  # ------------------------------------------------------------------ Artifacts (CodeDeploy bundles, CodePipeline, CFN templates)
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+          - Id: expire-old-bundles
+            Status: Enabled
+            Prefix: ec2/
+            ExpirationInDays: 180
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactsBucket.Arn, !Sub "${ArtifactsBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # ------------------------------------------------------------------ CloudFormation execution role
+  # Deployers (GitHub / CodeBuild) do NOT get rights to create infrastructure
+  # directly. They may only ask CloudFormation to do it, and CloudFormation
+  # assumes this role. Only the cloudformation service can assume it.
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-cfn-execution-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # ------------------------------------------------------------------ Least-privilege deploy policies
+  # APP deploy: push images, upload bundles, roll out ECS / CodeDeploy.
+  # It has NO CloudFormation write access => an app deployment physically
+  # cannot change infrastructure (requirement #4 enforced by IAM).
+  AppDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-app-deploy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EcrAuth
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: EcrPushPull
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:CompleteLayerUpload
+              - ecr:DescribeImages
+              - ecr:GetDownloadUrlForLayer
+              - ecr:InitiateLayerUpload
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+            Resource: [!GetAtt FrontendRepository.Arn, !GetAtt BackendRepository.Arn]
+          - Sid: EcsDeploy
+            Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:DescribeTaskDefinition
+              - ecs:RegisterTaskDefinition
+              - ecs:UpdateService
+              - ecs:DescribeClusters
+              - ecs:TagResource
+            Resource: "*"
+          - Sid: PassEcsRoles
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-ecs-*
+            Condition: { StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com } }
+          - Sid: CodeDeploy
+            Effect: Allow
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentGroup
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:GetApplicationRevision
+              - codedeploy:RegisterApplicationRevision
+              - codedeploy:ListDeployments
+              - codedeploy:StopDeployment
+            Resource:
+              - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}-*
+              - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}-*
+              - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*
+          - Sid: Bundles
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject, s3:GetObjectVersion]
+            Resource: !Sub "${ArtifactsBucket.Arn}/ec2/*"
+          - Sid: BundlesList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt ArtifactsBucket.Arn
+          - Sid: ReleaseParameters
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:PutParameter]
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+          - Sid: ReadOnlyDiscovery
+            Effect: Allow
+            Action: [cloudformation:DescribeStacks, elasticloadbalancing:DescribeLoadBalancers]
+            Resource: "*"
+
+  # INFRA deploy: may drive CloudFormation (which then uses the execution role).
+  InfraDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-infra-deploy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFormationOnProjectStacks
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListChangeSets
+              - cloudformation:GetTemplate
+              - cloudformation:DescribeStackResources
+              - cloudformation:ListStackResources
+              - cloudformation:TagResource
+              - cloudformation:UntagResource
+            Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*/*
+          - Sid: CloudFormationGlobal
+            Effect: Allow
+            Action: [cloudformation:ValidateTemplate, cloudformation:ListExports, cloudformation:ListStacks]
+            Resource: "*"
+          - Sid: PassExecutionRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt CloudFormationExecutionRole.Arn
+          - Sid: TemplateUpload
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject]
+            Resource: !Sub "${ArtifactsBucket.Arn}/cfn/*"
+          - Sid: TemplateBucketList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt ArtifactsBucket.Arn
+          - Sid: SeedFirstImageTag
+            Effect: Allow
+            Action: ecr:DescribeImages
+            Resource: [!GetAtt FrontendRepository.Arn, !GetAtt BackendRepository.Arn]
+          - Sid: ResolveParameters
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:GetParameters, ssm:PutParameter]
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+              - !Sub arn:aws:ssm:${AWS::Region}::parameter/aws/service/*
+
+  # ------------------------------------------------------------------ GitHub Actions OIDC (no long-lived AWS keys in GitHub)
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  GitHubAppDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-app-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # only the main branch, or jobs bound to a GitHub Environment
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:*
+      ManagedPolicyArns: [!Ref AppDeployPolicy]
+
+  GitHubInfraDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-infra-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:*
+      ManagedPolicyArns: [!Ref InfraDeployPolicy]
+
+Outputs:
+  FrontendRepositoryUri:
+    Value: !GetAtt FrontendRepository.RepositoryUri
+    Export: { Name: !Sub "${ProjectName}-shared-FrontendRepositoryUri" }
+  BackendRepositoryUri:
+    Value: !GetAtt BackendRepository.RepositoryUri
+    Export: { Name: !Sub "${ProjectName}-shared-BackendRepositoryUri" }
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export: { Name: !Sub "${ProjectName}-shared-ArtifactsBucket" }
+  ArtifactsBucketArn:
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export: { Name: !Sub "${ProjectName}-shared-ArtifactsBucketArn" }
+  CloudFormationExecutionRoleArn:
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+    Export: { Name: !Sub "${ProjectName}-shared-CfnExecutionRoleArn" }
+  AppDeployPolicyArn:
+    Value: !Ref AppDeployPolicy
+    Export: { Name: !Sub "${ProjectName}-shared-AppDeployPolicyArn" }
+  InfraDeployPolicyArn:
+    Value: !Ref InfraDeployPolicy
+    Export: { Name: !Sub "${ProjectName}-shared-InfraDeployPolicyArn" }
+  GitHubAppDeployRoleArn:
+    Description: Put this in the GitHub repo variable AWS_APP_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubAppDeployRole.Arn
+  GitHubInfraDeployRoleArn:
+    Description: Put this in the GitHub repo variable AWS_INFRA_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubInfraDeployRole.Arn

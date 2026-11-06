@@ -1,0 +1,16 @@
+# CodePipeline "app" pipeline - Build stage: test, build images + EC2 bundle, push.
+version: 0.2
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+      python: 3.12
+  pre_build:
+    commands:
+      - echo "Release tag = ${IMAGE_TAG}"
+      - bash scripts/test.sh
+  build:
+    commands:
+      - bash scripts/build-and-push.sh "${IMAGE_TAG}"

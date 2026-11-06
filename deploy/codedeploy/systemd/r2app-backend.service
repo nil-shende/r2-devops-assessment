@@ -1,0 +1,23 @@
+[Unit]
+Description=R2 backend API (FastAPI / uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=r2app
+Group=r2app
+WorkingDirectory=/opt/r2app/release/backend
+# Non-secret config written by EC2 user data (from CloudFormation).
+EnvironmentFile=/etc/r2app/app.env
+# APP_VERSION of this release (written by the build).
+EnvironmentFile=/opt/r2app/release/version.env
+ExecStart=/opt/r2app/release/backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+StandardOutput=append:/var/log/r2app/backend.log
+StandardError=append:/var/log/r2app/backend.log
+
+[Install]
+WantedBy=multi-user.target

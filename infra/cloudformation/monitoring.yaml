@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 MONITORING: SNS alert topic, CloudWatch alarms for the load balancer and
+  database, and one dashboard covering both deployment approaches.
+  Compute stacks (ecs.yaml / ec2.yaml) import the alert topic for their own alarms.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional - receives alarm notifications (confirm the subscription e-mail)
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${EnvironmentName}-alerts
+      # Note: CloudWatch alarms cannot publish to a topic encrypted with the
+      # AWS-managed alias/aws/sns key; a customer-managed KMS key (about 1 USD/month)
+      # with a policy for cloudwatch.amazonaws.com would be the prod upgrade.
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlbElb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-alb-5xx
+      AlarmDescription: Load balancer itself is returning 5xx (no healthy targets, etc.)
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  AlbLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-alb-latency
+      AlarmDescription: p95 target response time above 2 seconds
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions: [{ Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" } }]
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-db-cpu
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbInstanceId" } }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-db-free-storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbInstanceId" } }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648   # 2 GiB
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${EnvironmentName}
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+                "title":"ALB requests & errors","region":"${AWS::Region}","stat":"Sum","period":60,
+                "metrics":[
+                  ["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb}"],
+                  [".","HTTPCode_Target_5XX_Count",".","."],
+                  [".","HTTPCode_ELB_5XX_Count",".","."]]}},
+              {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+                "title":"ALB latency (p50 / p95)","region":"${AWS::Region}","period":60,
+                "metrics":[
+                  ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${Alb}",{"stat":"p50"}],
+                  ["...",{"stat":"p95"}]]}},
+              {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+                "title":"ECS services CPU / memory (containerized)","region":"${AWS::Region}","stat":"Average","period":60,
+                "metrics":[
+                  ["AWS/ECS","CPUUtilization","ClusterName","${ProjectName}-${EnvironmentName}","ServiceName","${ProjectName}-${EnvironmentName}-frontend"],
+                  ["...","${ProjectName}-${EnvironmentName}-backend"],
+                  [".","MemoryUtilization",".",".",".","${ProjectName}-${EnvironmentName}-frontend"],
+                  ["...","${ProjectName}-${EnvironmentName}-backend"]]}},
+              {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+                "title":"EC2 Auto Scaling group CPU (non-containerized)","region":"${AWS::Region}","stat":"Average","period":60,
+                "metrics":[
+                  ["AWS/EC2","CPUUtilization","AutoScalingGroupName","${ProjectName}-${EnvironmentName}-ec2-asg"]]}},
+              {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{
+                "title":"RDS CPU & connections","region":"${AWS::Region}","stat":"Average","period":60,
+                "metrics":[
+                  ["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Db}"],
+                  [".","DatabaseConnections",".",".",{"yAxis":"right"}]]}},
+              {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{
+                "title":"RDS free storage / memory (bytes)","region":"${AWS::Region}","stat":"Minimum","period":300,
+                "metrics":[
+                  ["AWS/RDS","FreeStorageSpace","DBInstanceIdentifier","${Db}"],
+                  [".","FreeableMemory",".","."]]}}
+            ]
+          }
+        - Alb: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" }
+          Db: { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbInstanceId" }
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-AlertTopicArn" }
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}

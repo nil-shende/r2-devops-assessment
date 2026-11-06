@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 EDGE: internet-facing Application Load Balancer (spans both AZs) and an
+  optional AWS WAF web ACL. Listeners are owned by the compute stacks:
+  ecs.yaml adds port 80/443 (containerized), ec2.yaml adds 8080/8443 (non-containerized).
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  EnableDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  EnableWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: AWS WAF is not free-tier (about 5 USD/month + rules) - enable for prod
+  WafRateLimitPer5Min:
+    Type: Number
+    Default: 2000
+
+Conditions:
+  Waf: !Equals [!Ref EnableWaf, "true"]
+
+Resources:
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Split [",", { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-PublicSubnetIds" }]
+      SecurityGroups: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-AlbSgId" }]
+      LoadBalancerAttributes:
+        - { Key: deletion_protection.enabled, Value: !Ref EnableDeletionProtection }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-alb" }]
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: Waf
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-web-acl
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-${EnvironmentName}-web-acl
+      Rules:
+        - Name: AWSManagedCommon
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common }
+        - Name: AWSManagedKnownBadInputs
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: bad-inputs }
+        - Name: RateLimitPerIp
+          Priority: 3
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement: { Limit: !Ref WafRateLimitPer5Min, AggregateKeyType: IP }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: rate-limit }
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: Waf
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  LoadBalancerArn:
+    Value: !Ref LoadBalancer
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-AlbArn" }
+  LoadBalancerFullName:
+    Description: Used as the CloudWatch metric dimension
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-AlbFullName" }
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-AlbDnsName" }

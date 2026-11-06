@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  R2 DATABASE: Amazon RDS for PostgreSQL in the isolated data subnets.
+  The master password is generated and stored by RDS in AWS Secrets Manager
+  (ManageMasterUserPassword) and rotated automatically - no human ever sees it
+  and it never appears in a template, parameter or pipeline log.
+
+Parameters:
+  ProjectName: { Type: String, Default: r2app }
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: db.t3.micro / db.t4g.micro are free-tier eligible
+  EngineVersion:
+    Type: String
+    Default: "16"
+    Description: Major version - RDS picks the current default minor version
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 0
+    Description: Storage autoscaling ceiling in GB (0 = disabled)
+  MultiAz:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  BackupRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 35
+    Description: Free-plan accounts may be limited to 1 day
+  DeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  DatabaseName:
+    Type: String
+    Default: appdb
+  MasterUsername:
+    Type: String
+    Default: dbadmin
+
+Conditions:
+  StorageAutoscaling: !Not [!Equals [!Ref MaxAllocatedStorage, 0]]
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${ProjectName}-${EnvironmentName} isolated data subnets
+      SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DataSubnetIds" }]
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${ProjectName}-${EnvironmentName} postgres parameters
+      Family: !Sub postgres${EngineVersion}
+      Parameters:
+        rds.force_ssl: "1"                 # reject any non-TLS connection
+        log_min_duration_statement: "1000" # log queries slower than 1s
+        log_connections: "1"
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${EnvironmentName}-postgres
+      Engine: postgres
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref MasterUsername
+      ManageMasterUserPassword: true       # password lives in Secrets Manager, rotated by RDS
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !If [StorageAutoscaling, !Ref MaxAllocatedStorage, !Ref "AWS::NoValue"]
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref MultiAz
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups: [{ "Fn::ImportValue": !Sub "${ProjectName}-${EnvironmentName}-DbSgId" }]
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: "20:00-20:30"            # UTC (01:30 IST)
+      PreferredMaintenanceWindow: "sun:21:00-sun:21:30"
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DeletionProtection
+      EnableCloudwatchLogsExports: [postgresql]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${EnvironmentName}-postgres" }]
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbEndpoint" }
+  DbPort:
+    Value: !GetAtt Database.Endpoint.Port
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbPort" }
+  DbName:
+    Value: !Ref DatabaseName
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbName" }
+  DbInstanceId:
+    Value: !Ref Database
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbInstanceId" }
+  DbSecretArn:
+    Description: Secrets Manager secret (JSON with username/password) created and rotated by RDS
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub "${ProjectName}-${EnvironmentName}-DbSecretArn" }
